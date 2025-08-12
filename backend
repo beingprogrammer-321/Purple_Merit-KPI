@@ -1,0 +1,494 @@
+// Repository: GreenCart-Backend-Express
+// Structure: each file is marked with a header comment like // FILE: <path>
+
+// FILE: package.json
+{
+  "name": "greencart-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "seed": "node scripts/loadData.js",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "mongoose": "^7.3.1",
+    "csv-parse": "^5.4.0"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0",
+    "supertest": "^6.3.3",
+    "nodemon": "^2.0.22"
+  }
+}
+
+// FILE: .env.example
+// Copy to .env and fill values
+MONGO_URI=mongodb://localhost:27017/greencart
+JWT_SECRET=your_jwt_secret_here
+PORT=4000
+
+// FILE: server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const authRoutes = require('./routes/auth');
+const driverRoutes = require('./routes/drivers');
+const routeRoutes = require('./routes/routes');
+const orderRoutes = require('./routes/orders');
+const simRoutes = require('./routes/simulations');
+const {errorHandler} = require('./middleware/errorHandler');
+
+dotenv.config();
+const app = express();
+app.use(express.json());
+app.use(cors({origin:true}));
+
+app.use('/api/auth', authRoutes);
+app.use('/api/drivers', driverRoutes);
+app.use('/api/routes', routeRoutes);
+app.use('/api/orders', orderRoutes);
+app.use('/api/simulations', simRoutes);
+
+// health
+app.get('/api/health', (req,res)=>res.json({ok:true, time: new Date()}));
+
+app.use(errorHandler);
+
+const PORT = process.env.PORT || 4000;
+mongoose.connect(process.env.MONGO_URI, {useNewUrlParser:true, useUnifiedTopology:true})
+  .then(()=>{
+    console.log('Mongo connected');
+    app.listen(PORT, ()=>console.log('Listening on', PORT));
+  }).catch(err=>{ console.error('DB connect error', err); process.exit(1); });
+
+// FILE: models/User.js
+const {Schema, model} = require('mongoose');
+const userSchema = new Schema({
+  name: {type:String, required:true},
+  email: {type:String, required:true, unique:true},
+  passwordHash: {type:String, required:true},
+  role: {type:String, enum:['manager','admin'], default:'manager'}
+}, {timestamps:true});
+module.exports = model('User', userSchema);
+
+// FILE: models/Driver.js
+const {Schema: S, model: M} = require('mongoose');
+const driverSchema = new S({
+  name: {type:String, required:true},
+  currentShiftHours: {type:Number, default:0},
+  past7DaysHours: {type:[Number], default: []},
+  status: {type:String, enum:['available','on_route','off_duty'], default:'available'},
+  speedKmph: {type:Number, default:30},
+  costPerHour: {type:Number, default:80}
+}, {timestamps:true});
+module.exports = M('Driver', driverSchema);
+
+// FILE: models/Route.js
+const {Schema: RS, model: RM} = require('mongoose');
+const routeSchema = new RS({
+  routeId: {type:String, required:true, unique:true},
+  distanceKm: {type:Number, required:true},
+  trafficLevel: {type:String, enum:['Low','Medium','High'], default:'Medium'},
+  baseTimeMin: {type:Number, required:true} // minutes
+}, {timestamps:true});
+module.exports = RM('Route', routeSchema);
+
+// FILE: models/Order.js
+const {Schema: OS, model: OM} = require('mongoose');
+const orderSchema = new OS({
+  orderId: {type:String, required:true, unique:true},
+  value_rs: {type:Number, required:true},
+  assignedRoute: {type:String, required:true}, // routeId
+  deliveryTimestamp: {type:Date},
+  status: {type:String, enum:['pending','assigned','delivered','failed'], default:'pending'}
+}, {timestamps:true});
+module.exports = OM('Order', orderSchema);
+
+// FILE: models/Simulation.js
+const {Schema: SS, model: SM} = require('mongoose');
+const simulationSchema = new SS({
+  name: {type:String},
+  params: {type:Object, required:true},
+  result: {type:Object, required:true},
+  createdBy: {type:SS.Types.ObjectId, ref:'User'},
+  createdAt: {type:Date, default: Date.now}
+});
+module.exports = SM('Simulation', simulationSchema);
+
+// FILE: middleware/auth.js
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+async function requireAuth(req,res,next){
+  try{
+    const header = req.headers.authorization;
+    if(!header) return res.status(401).json({success:false, error:{message:'Missing Authorization header'}});
+    const [bearer, token] = header.split(' ');
+    if(bearer !== 'Bearer' || !token) return res.status(401).json({success:false, error:{message:'Invalid Authorization format'}});
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(payload.id).select('-passwordHash');
+    if(!user) return res.status(401).json({success:false, error:{message:'User not found'}});
+    req.user = user;
+    next();
+  }catch(err){
+    return res.status(401).json({success:false, error:{message:'Invalid token', details: err.message}});
+  }
+}
+module.exports = {requireAuth};
+
+// FILE: middleware/errorHandler.js
+function errorHandler(err, req, res, next){
+  console.error(err);
+  if(res.headersSent) return next(err);
+  res.status(err.status || 500).json({success:false, error:{message: err.message || 'Server error'}});
+}
+module.exports = {errorHandler};
+
+// FILE: routes/auth.js
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+router.post('/register', async (req,res,next)=>{
+  try{
+    const {name,email,password,role} = req.body;
+    if(!name||!email||!password) return res.status(400).json({success:false, error:{message:'Missing fields'}});
+    const exists = await User.findOne({email}); if(exists) return res.status(409).json({success:false, error:{message:'Email exists'}});
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await User.create({name,email,passwordHash,role: role||'manager'});
+    res.json({success:true, user:{id:user._id, name:user.name, email:user.email, role:user.role}});
+  }catch(err){next(err);} 
+});
+
+router.post('/login', async (req,res,next)=>{
+  try{
+    const {email,password} = req.body;
+    if(!email||!password) return res.status(400).json({success:false, error:{message:'Missing credentials'}});
+    const user = await User.findOne({email});
+    if(!user) return res.status(401).json({success:false, error:{message:'Invalid email or password'}});
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if(!ok) return res.status(401).json({success:false, error:{message:'Invalid email or password'}});
+    const token = jwt.sign({id:user._id, role:user.role}, process.env.JWT_SECRET, {expiresIn:'8h'});
+    res.json({success:true, token, user:{id:user._id, name:user.name, email:user.email, role:user.role}});
+  }catch(err){next(err);} 
+});
+
+module.exports = router;
+
+// FILE: routes/drivers.js
+const express = require('express');
+const router = express.Router();
+const Driver = require('../models/Driver');
+const {requireAuth} = require('../middleware/auth');
+
+router.use(requireAuth);
+
+router.get('/', async (req,res,next)=>{
+  const drivers = await Driver.find(); res.json({success:true, drivers});
+});
+router.post('/', async (req,res,next)=>{
+  const {name, currentShiftHours, past7DaysHours, speedKmph, costPerHour} = req.body;
+  if(!name) return res.status(400).json({success:false, error:{message:'Name required'}});
+  const d = await Driver.create({name, currentShiftHours, past7DaysHours, speedKmph, costPerHour});
+  res.json({success:true, driver: d});
+});
+router.put('/:id', async (req,res,next)=>{
+  const d = await Driver.findByIdAndUpdate(req.params.id, req.body, {new:true});
+  if(!d) return res.status(404).json({success:false, error:{message:'Not found'}});
+  res.json({success:true, driver:d});
+});
+router.delete('/:id', async (req,res,next)=>{
+  const d = await Driver.findByIdAndDelete(req.params.id);
+  if(!d) return res.status(404).json({success:false, error:{message:'Not found'}});
+  res.json({success:true});
+});
+module.exports = router;
+
+// FILE: routes/routes.js
+const express = require('express');
+const router = express.Router();
+const Route = require('../models/Route');
+const {requireAuth} = require('../middleware/auth');
+router.use(requireAuth);
+router.get('/', async (req,res)=>{ const r = await Route.find(); res.json({success:true, routes:r}); });
+router.post('/', async (req,res)=>{ const {routeId,distanceKm,trafficLevel,baseTimeMin}=req.body; if(!routeId) return res.status(400).json({success:false,error:{message:'routeId required'}}); const r = await Route.create({routeId,distanceKm,trafficLevel,baseTimeMin}); res.json({success:true, route:r}); });
+router.put('/:id', async (req,res)=>{ const r = await Route.findByIdAndUpdate(req.params.id, req.body, {new:true}); if(!r) return res.status(404).json({success:false,error:{message:'not found'}}); res.json({success:true,route:r});});
+router.delete('/:id', async (req,res)=>{ const r = await Route.findByIdAndDelete(req.params.id); if(!r) return res.status(404).json({success:false,error:{message:'not found'}}); res.json({success:true});});
+module.exports = router;
+
+// FILE: routes/orders.js
+const express = require('express');
+const router = express.Router();
+const Order = require('../models/Order');
+const {requireAuth} = require('../middleware/auth');
+router.use(requireAuth);
+router.get('/', async (req,res)=>{ const o = await Order.find(); res.json({success:true, orders:o}); });
+router.post('/', async (req,res)=>{ const {orderId,value_rs,assignedRoute,deliveryTimestamp,status} = req.body; if(!orderId||!value_rs||!assignedRoute) return res.status(400).json({success:false,error:{message:'Missing fields'}}); const or = await Order.create({orderId,value_rs,assignedRoute,deliveryTimestamp,status}); res.json({success:true, order: or}); });
+router.put('/:id', async (req,res)=>{ const or = await Order.findByIdAndUpdate(req.params.id, req.body, {new:true}); if(!or) return res.status(404).json({success:false,error:{message:'not found'}}); res.json({success:true,order:or});});
+router.delete('/:id', async (req,res)=>{ const or = await Order.findByIdAndDelete(req.params.id); if(!or) return res.status(404).json({success:false,error:{message:'not found'}}); res.json({success:true});});
+module.exports = router;
+
+// FILE: utils/simulationEngine.js
+// Core simulation logic implementing company rules.
+const Driver = require('../models/Driver');
+const Route = require('../models/Route');
+const Order = require('../models/Order');
+
+/**
+ * Inputs:
+ *  - availableDrivers: number
+ *  - routeStartTime: 'HH:MM'
+ *  - maxHoursPerDriver: number
+ *  - optional: userId
+ *
+ * Returns KPI object plus per-order details
+ */
+async function runSimulation({availableDrivers, routeStartTime, maxHoursPerDriver}){
+  // validation
+  if(typeof availableDrivers !== 'number' || availableDrivers <= 0) throw {status:400, message:'availableDrivers must be positive integer'};
+  if(typeof maxHoursPerDriver !== 'number' || maxHoursPerDriver <= 0) throw {status:400, message:'maxHoursPerDriver must be positive number'};
+  // parse start time
+  const [hh,mm] = (routeStartTime||'08:00').split(':').map(Number);
+  if(Number.isNaN(hh) || Number.isNaN(mm) || hh<0 || hh>23 || mm<0 || mm>59) throw {status:400, message:'routeStartTime invalid'};
+
+  // load data
+  const routes = await Route.find();
+  const orders = await Order.find({status: {$in:['pending','assigned']}}).lean();
+  if(availableDrivers > 5000) throw {status:400, message:'availableDrivers too large'};
+
+  // choose drivers pool: simply take availableDrivers from DB or create virtual drivers
+  let drivers = await Driver.find().limit(availableDrivers).lean();
+  // if DB has fewer drivers than asked, create virtual drivers
+  if(drivers.length < availableDrivers){
+    const deficit = availableDrivers - drivers.length;
+    for(let i=0;i<deficit;i++){
+      drivers.push({name:`Virtual-${i+1}`, currentShiftHours:0, past7DaysHours:[], speedKmph:30, costPerHour:80, _id: `virt${i+1}`});
+    }
+  }
+
+  // mapping of routeId to route meta
+  const routeMap = {};
+  for(const r of routes) routeMap[r.routeId] = r;
+
+  // assign orders round-robin to drivers (fair & deterministic)
+  const perDriver = Array.from({length:availableDrivers}).map(()=>({delivered:0, onTime:0, late:0, distanceKm:0, timeMin:0, penalties:0, bonuses:0, fuelCost:0, revenue:0}));
+
+  // Company rules constants
+  const LATE_PENALTY = 50; // ₹ per late order
+  const HIGH_VALUE_BONUS_PCT = 0.10; // 10% of order value
+  const BASE_FUEL_PER_KM = 5; // ₹/km
+  const HIGH_TRAFFIC_SURCHARGE = 2; // ₹/km extra if traffic == 'High'
+
+  const perOrderResults = [];
+  let driverIdx = 0;
+
+  for(const ord of orders){
+    const r = routeMap[ord.assignedRoute];
+    if(!r){
+      perOrderResults.push({orderId: ord.orderId, status:'failed', reason:'route not found'});
+      continue;
+    }
+    // estimate time: baseTimeMin from route
+    let estMin = r.baseTimeMin;
+    // if driver had past >8 hours yesterday, apply fatigue: decrease speed by 30% -> increases time by ~30%
+    const drv = drivers[driverIdx % drivers.length];
+    const drvPastHours = Array.isArray(drv.past7DaysHours) && drv.past7DaysHours.length>=1 ? drv.past7DaysHours[drv.past7DaysHours.length-1] || 0 : 0;
+    let fatigueMultiplier = 1;
+    if(drvPastHours > 8) fatigueMultiplier = 1.3; // 30% slower => 30% more time
+    const actualMin = Math.round(estMin * fatigueMultiplier);
+
+    // determine late or on-time: delivery time > baseTime + 10min -> late
+    const isLate = actualMin > (r.baseTimeMin + 10);
+    const penalty = isLate ? LATE_PENALTY : 0;
+
+    // fuel cost: base cost per km * distance
+    let fuelPerKm = BASE_FUEL_PER_KM + (r.trafficLevel === 'High' ? HIGH_TRAFFIC_SURCHARGE : 0);
+    const fuelCost = fuelPerKm * r.distanceKm;
+
+    // high value bonus
+    const hvBonus = (ord.value_rs > 1000 && !isLate) ? ord.value_rs * HIGH_VALUE_BONUS_PCT : 0;
+
+    // profit contribution: order value + bonus - penalties - fuelCost
+    const profit = (ord.value_rs + hvBonus - penalty - fuelCost);
+
+    // update per-driver stats
+    const pd = perDriver[driverIdx % perDriver.length];
+    pd.delivered += 1;
+    pd.onTime += (!isLate?1:0);
+    pd.late += (isLate?1:0);
+    pd.distanceKm += r.distanceKm;
+    pd.timeMin += actualMin;
+    pd.penalties += penalty;
+    pd.bonuses += hvBonus;
+    pd.fuelCost += fuelCost;
+    pd.revenue += ord.value_rs;
+
+    perOrderResults.push({orderId: ord.orderId, assignedDriver: drv._id, route: r.routeId, timeMin: actualMin, isLate, penalty, fuelCost, hvBonus, profit});
+
+    driverIdx++;
+  }
+
+  // aggregate KPIs
+  const totalDelivered = perOrderResults.filter(x=>x.status !== 'failed').length;
+  const totalLate = perOrderResults.filter(x=>x.isLate).length;
+  const totalOnTime = totalDelivered - totalLate;
+  const totalPenalties = perOrderResults.reduce((s,x)=>s+(x.penalty||0),0);
+  const totalBonuses = perOrderResults.reduce((s,x)=>s+(x.hvBonus||0),0);
+  const totalFuel = perOrderResults.reduce((s,x)=>s+(x.fuelCost||0),0);
+  const totalRevenue = perOrderResults.reduce((s,x)=>s + (x.profit + (x.fuelCost||0) + (x.penalty||0) - (x.hvBonus||0) ),0) + totalBonuses; // derive differently below
+
+  // better compute overall profit as sum(order value + bonus - penalty - fuel)
+  const overallProfit = perOrderResults.reduce((s,x)=> s + ((x && x.profit) || 0), 0);
+
+  const efficiency = totalDelivered === 0 ? 0 : (totalOnTime / totalDelivered) * 100;
+
+  // driver utilization: total driver minutes used / (availableDrivers * maxHoursPerDriver * 60)
+  const totalDriverMinutes = perDriver.reduce((s,d)=>s + d.timeMin, 0);
+  const maxAvailableMinutes = availableDrivers * maxHoursPerDriver * 60;
+  const driverUtilization = maxAvailableMinutes === 0 ? 0 : (totalDriverMinutes / maxAvailableMinutes) * 100;
+
+  return {
+    KPIs: {
+      totalDelivered,
+      totalOnTime,
+      totalLate,
+      totalPenalties,
+      totalBonuses,
+      totalFuelCost: totalFuel,
+      overallProfit,
+      efficiency: Number(efficiency.toFixed(2)),
+      driverUtilization: Number(driverUtilization.toFixed(2))
+    },
+    perDriver,
+    perOrderResults
+  };
+}
+module.exports = {runSimulation};
+
+// FILE: routes/simulations.js
+const express = require('express');
+const router = express.Router();
+const {requireAuth} = require('../middleware/auth');
+const Simulation = require('../models/Simulation');
+const {runSimulation} = require('../utils/simulationEngine');
+
+router.use(requireAuth);
+
+router.post('/run', async (req,res,next)=>{
+  try{
+    const {availableDrivers, routeStartTime, maxHoursPerDriver, name} = req.body;
+    // validate presence
+    if(availableDrivers == null || routeStartTime == null || maxHoursPerDriver == null) return res.status(400).json({success:false, error:{message:'Missing simulation parameters'}});
+    const result = await runSimulation({availableDrivers, routeStartTime, maxHoursPerDriver});
+    const sim = await Simulation.create({name: name||`Sim ${new Date().toISOString()}`, params: {availableDrivers, routeStartTime, maxHoursPerDriver}, result, createdBy: req.user._id});
+    res.json({success:true, simulationId: sim._id, result});
+  }catch(err){ next(err); }
+});
+
+router.get('/', async (req,res)=>{ const sims = await Simulation.find().sort({createdAt:-1}).limit(50); res.json({success:true, sims}); });
+router.get('/:id', async (req,res)=>{ const s = await Simulation.findById(req.params.id); if(!s) return res.status(404).json({success:false,error:{message:'Not found'}}); res.json({success:true, s}); });
+
+module.exports = router;
+
+// FILE: scripts/loadData.js
+// Load initial data from JSON/CSV located in ./data (drivers.json, routes.json, orders.json)
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+dotenv.config();
+const fs = require('fs');
+const path = require('path');
+const Driver = require('../models/Driver');
+const Route = require('../models/Route');
+const Order = require('../models/Order');
+
+async function run(){
+  await mongoose.connect(process.env.MONGO_URI);
+  const base = path.join(__dirname,'..','data');
+  const drivers = JSON.parse(fs.readFileSync(path.join(base,'drivers.json')));
+  const routes = JSON.parse(fs.readFileSync(path.join(base,'routes.json')));
+  const orders = JSON.parse(fs.readFileSync(path.join(base,'orders.json')));
+  await Driver.deleteMany({}); await Route.deleteMany({}); await Order.deleteMany({});
+  await Driver.insertMany(drivers); await Route.insertMany(routes); await Order.insertMany(orders);
+  console.log('Seeded data');
+  process.exit(0);
+}
+run().catch(err=>{console.error(err); process.exit(1)});
+
+// FILE: data/drivers.json
+[
+  {"name":"Ram","currentShiftHours":4,"past7DaysHours":[6,7,5,8,9,4,6],"speedKmph":30,"costPerHour":80},
+  {"name":"Shyam","currentShiftHours":3,"past7DaysHours":[7,8,7,6,5,8,4],"speedKmph":28,"costPerHour":75}
+]
+
+// FILE: data/routes.json
+[
+  {"routeId":"R1","distanceKm":5,"trafficLevel":"High","baseTimeMin":30},
+  {"routeId":"R2","distanceKm":3,"trafficLevel":"Medium","baseTimeMin":18},
+  {"routeId":"R3","distanceKm":8,"trafficLevel":"Low","baseTimeMin":45}
+]
+
+// FILE: data/orders.json
+[
+  {"orderId":"ORD-001","value_rs":1200,"assignedRoute":"R1","deliveryTimestamp":null,"status":"pending"},
+  {"orderId":"ORD-002","value_rs":450,"assignedRoute":"R2","deliveryTimestamp":null,"status":"pending"},
+  {"orderId":"ORD-003","value_rs":2500,"assignedRoute":"R3","deliveryTimestamp":null,"status":"pending"},
+  {"orderId":"ORD-004","value_rs":700,"assignedRoute":"R1","deliveryTimestamp":null,"status":"pending"}
+]
+
+// FILE: tests/simulation.test.js
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+dotenv.config();
+const {runSimulation} = require('../utils/simulationEngine');
+
+beforeAll(async ()=>{ await mongoose.connect(process.env.MONGO_URI); });
+afterAll(async ()=>{ await mongoose.disconnect(); });
+
+test('invalid drivers param throws', async ()=>{
+  await expect(runSimulation({availableDrivers:0, routeStartTime:'08:00', maxHoursPerDriver:8})).rejects.toMatchObject({status:400});
+});
+
+test('invalid time format throws', async ()=>{
+  await expect(runSimulation({availableDrivers:2, routeStartTime:'99:99', maxHoursPerDriver:8})).rejects.toMatchObject({status:400});
+});
+
+test('runSimulation returns KPIs object', async ()=>{
+  const res = await runSimulation({availableDrivers:2, routeStartTime:'08:00', maxHoursPerDriver:8});
+  expect(res).toHaveProperty('KPIs');
+  expect(res.KPIs).toHaveProperty('overallProfit');
+});
+
+// FILE: tests/routes.unit.test.js
+const Route = require('../models/Route');
+
+test('route model requires routeId', async ()=>{
+  await expect(Route.create({distanceKm:5,baseTimeMin:10,trafficLevel:'Low'})).rejects.toThrow();
+});
+
+// FILE: README.md
+# GreenCart Backend (Express + MongoDB)
+
+This repository contains an Express backend that implements the GreenCart Logistics simulation engine and CRUD APIs required by the assessment.
+
+## Quick start
+1. copy `.env.example` to `.env` and fill `MONGO_URI` and `JWT_SECRET`
+2. `npm install`
+3. `npm run seed` to load sample data (requires Mongo running)
+4. `npm run dev` to start server
+5. Use Postman to register a user `/api/auth/register` then login `/api/auth/login` and call protected endpoints with `Authorization: Bearer <token>`
+
+## Run tests
+`npm test`
+
+
+// End of repository
