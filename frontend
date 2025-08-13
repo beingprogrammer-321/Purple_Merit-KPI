@@ -1,0 +1,161 @@
+import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, Navigate } from 'react-router-dom';
+import axios from 'axios';
+import { Bar, Pie } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip,
+  Legend,
+  ArcElement,
+} from 'chart.js';
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend
+);
+
+const API_BASE = 'http://localhost:5000/api'; // backend URL
+
+// Axios instance with auth token
+const api = axios.create({ baseURL: API_BASE });
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+function Login({ setAuth }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    const res = await api.post('/auth/login', { email, password });
+    localStorage.setItem('token', res.data.token);
+    setAuth(true);
+  };
+  return (
+    <form onSubmit={handleLogin} className="p-4 max-w-sm mx-auto">
+      <h2 className="text-xl mb-4">Login</h2>
+      <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" className="border p-2 w-full mb-2" />
+      <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" className="border p-2 w-full mb-2" />
+      <button className="bg-green-600 text-white p-2 w-full">Login</button>
+    </form>
+  );
+}
+
+function Dashboard() {
+  const [simulations, setSimulations] = useState([]);
+  useEffect(() => {
+    api.get('/simulations').then((res) => setSimulations(res.data));
+  }, []);
+
+  const chartData = {
+    labels: simulations.map((s) => s.name),
+    datasets: [
+      {
+        label: 'Profit',
+        data: simulations.map((s) => s.totalProfit),
+        backgroundColor: 'rgba(75, 192, 192, 0.6)',
+      },
+    ],
+  };
+
+  return (
+    <div className="p-4">
+      <h2 className="text-xl mb-4">Dashboard</h2>
+      <Bar data={chartData} />
+    </div>
+  );
+}
+
+function SimulationPage() {
+  const [availableDrivers, setAvailableDrivers] = useState(5);
+  const [routeStartTime, setRouteStartTime] = useState('08:00');
+  const [maxHoursPerDriver, setMaxHoursPerDriver] = useState(8);
+  const [name, setName] = useState('');
+  const [result, setResult] = useState(null);
+
+  const runSimulation = async () => {
+    const res = await api.post('/simulations/run', {
+      availableDrivers,
+      routeStartTime,
+      maxHoursPerDriver,
+      name,
+    });
+    setResult(res.data);
+  };
+
+  return (
+    <div className="p-4">
+      <h2 className="text-xl mb-4">Run Simulation</h2>
+      <input type="number" value={availableDrivers} onChange={(e) => setAvailableDrivers(+e.target.value)} placeholder="Drivers" className="border p-2 w-full mb-2" />
+      <input type="time" value={routeStartTime} onChange={(e) => setRouteStartTime(e.target.value)} className="border p-2 w-full mb-2" />
+      <input type="number" value={maxHoursPerDriver} onChange={(e) => setMaxHoursPerDriver(+e.target.value)} placeholder="Max Hours" className="border p-2 w-full mb-2" />
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Simulation Name" className="border p-2 w-full mb-2" />
+      <button onClick={runSimulation} className="bg-blue-600 text-white p-2 w-full">Run</button>
+
+      {result && (
+        <div className="mt-4">
+          <h3 className="text-lg font-bold">Results</h3>
+          <p>Profit: {result.totalProfit}</p>
+          <p>Efficiency: {result.efficiency}%</p>
+          <Pie data={{
+            labels: ['Profit', 'Fuel Cost', 'Penalties'],
+            datasets: [{
+              data: [result.totalProfit, result.totalFuelCost, result.totalPenalties],
+              backgroundColor: ['green', 'red', 'orange'],
+            }],
+          }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ManagementPage() {
+  const [drivers, setDrivers] = useState([]);
+  const [routes, setRoutes] = useState([]);
+  useEffect(() => {
+    api.get('/drivers').then((res) => setDrivers(res.data));
+    api.get('/routes').then((res) => setRoutes(res.data));
+  }, []);
+  return (
+    <div className="p-4">
+      <h2 className="text-xl mb-4">Management</h2>
+      <h3 className="text-lg">Drivers</h3>
+      <ul>{drivers.map((d) => <li key={d._id}>{d.name}</li>)}</ul>
+      <h3 className="text-lg mt-4">Routes</h3>
+      <ul>{routes.map((r) => <li key={r._id}>{r.name}</li>)}</ul>
+    </div>
+  );
+}
+
+function App() {
+  const [auth, setAuth] = useState(!!localStorage.getItem('token'));
+  return (
+    <Router>
+      <nav className="p-4 bg-gray-200 flex gap-4">
+        <Link to="/dashboard">Dashboard</Link>
+        <Link to="/simulate">Simulate</Link>
+        <Link to="/manage">Manage</Link>
+      </nav>
+      <Routes>
+        <Route path="/" element={auth ? <Navigate to="/dashboard" /> : <Login setAuth={setAuth} />} />
+        <Route path="/dashboard" element={auth ? <Dashboard /> : <Navigate to="/" />} />
+        <Route path="/simulate" element={auth ? <SimulationPage /> : <Navigate to="/" />} />
+        <Route path="/manage" element={auth ? <ManagementPage /> : <Navigate to="/" />} />
+      </Routes>
+    </Router>
+  );
+}
+
+export default App;
